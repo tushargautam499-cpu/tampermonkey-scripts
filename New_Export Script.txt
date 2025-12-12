@@ -1,0 +1,574 @@
+// ==UserScript==
+// @name         Unprocessed Keywords - Export CSV (v2.9)
+// @namespace    http://tampermonkey.net/
+// @version      2.9
+// @description  Export unprocessed keywords.
+// @author       Tushar Gautam- @tuxgauta
+// @match        https://content-risk-engine-iad.iad.proxy.amazon.com/keyword-management/unprocessed-keywords*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_download
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  "use strict";
+  console.info("[CRE Export v2.9] loaded");
+
+  const API_ENDPOINT = "/api/keyword-management/list-unprocessed-keywords";
+  const PAGE_SIZE = 100;
+  const DEFAULT_DELAY_MS = 1000; // 1 second between page requests
+  const EXPORT_BTN_TEXT = "EXPORT CSV";
+  const AUTO_CLOSE_SECONDS = 1; // modal auto-close after completion
+
+  /* ------------------ Helpers ------------------ */
+
+  function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  function safeText(v) {
+    if (v === null || v === undefined) return "";
+    return String(v);
+  }
+
+  function formatEpochMsToUTC(ms) {
+    if (!ms) return "";
+    const d = new Date(Number(ms));
+    if (Number.isNaN(d.getTime())) return "";
+    const pad = (n) => String(n).padStart(2, "0");
+    const Y = d.getUTCFullYear();
+    const M = pad(d.getUTCMonth() + 1);
+    const D = pad(d.getUTCDate());
+    const h = pad(d.getUTCHours());
+    const m = pad(d.getUTCMinutes());
+    const s = pad(d.getUTCSeconds());
+    return `${Y}-${M}-${D} ${h}:${m}:${s}`;
+  }
+
+  /* ------------------ Read UI dropdowns ------------------ */
+
+  function readReactSelectValues(dropdownId) {
+    try {
+      if (!dropdownId) return [];
+      const container = document.getElementById(dropdownId);
+      if (!container) return [];
+      const chips = Array.from(container.querySelectorAll(".css-1rhbuit-multiValue, .css-1g6gooi .multi-value, .multi-value"));
+      if (chips && chips.length) return chips.map((c) => c.textContent.trim()).filter(Boolean);
+      const single = container.querySelector(".css-1uccc91-singleValue");
+      if (single && single.textContent && single.textContent.trim()) return [single.textContent.trim()];
+      const placeholder = container.querySelector(".css-1wa3eu0-placeholder");
+      if (placeholder && placeholder.textContent && placeholder.textContent.trim()) {
+        const txt = placeholder.textContent.trim();
+        return /select/i.test(txt) ? [] : [txt];
+      }
+      const t = (container.innerText || "").trim();
+      if (!t) return [];
+      return t.split(/\r?\n|,/).map((s) => s.trim()).filter(Boolean);
+    } catch (e) {
+      console.warn("readReactSelectValues error", e);
+      return [];
+    }
+  }
+
+  function buildTemplateFromReactSelects() {
+    const adPrograms = readReactSelectValues("ap-dropdown");
+    const marketplaces = readReactSelectValues("mp-dropdown");
+    const kwSource = readReactSelectValues("kwsource-dropdown");
+    const policies = readReactSelectValues("policy-dropdown");
+    const states = readReactSelectValues("kwstate-dropdown") || [];
+
+    const processes = adPrograms.length ? adPrograms.map((s) => s.toUpperCase()) : [];
+    const mps = marketplaces.length ? marketplaces.map((s) => s.toUpperCase()) : [];
+    const kws = kwSource.length ? kwSource.map((s) => s.toUpperCase()) : [];
+    const labels = policies.length ? policies.map((s) => s.toUpperCase()) : [];
+
+    const t = {
+      author: "",
+      keywordSearchCriteria: {
+        assignedTos: [],
+        keywordSources: kws,
+        labels: labels,
+        marketplaces: mps,
+        processes: processes,
+        states: states,
+      },
+      pagination: { size: PAGE_SIZE, startIndex: 0 },
+    };
+
+    return { template: t, detected: { processes, marketplaces: mps, kwSource: kws, policies: labels } };
+  }
+
+  /* ------------------ Parse server JSON into item array ------------------ */
+
+  function normalizeItemsArray(json) {
+    if (!json) return [];
+    if (Array.isArray(json.keywordRecords)) return json.keywordRecords;
+    if (Array.isArray(json.items)) return json.items;
+    if (Array.isArray(json.results)) return json.results;
+    const keys = Object.keys(json || {});
+    if (keys.length && keys.every((k) => /^\d+$/.test(k))) {
+      return keys.sort((a, b) => Number(a) - Number(b)).map((k) => json[k]);
+    }
+    for (const k of keys) if (Array.isArray(json[k])) return json[k];
+    return [];
+  }
+
+  /* ------------------ STATE LINK extraction: strict rules (no fallback) ------------------ */
+
+  function extractStateLink(item) {
+    try {
+      if (!item || !item.stateConfigMap) return "";
+      // 1) Experiment details preferred
+      if (item.stateConfigMap.EXPERIMENT_DETAILS) {
+        const exp = String(item.stateConfigMap.EXPERIMENT_DETAILS || "").trim();
+        if (exp && exp.includes("/")) {
+          return `${location.origin}/experiments/view/${exp}`;
+        }
+      }
+      // 2) RULE_IDS -> all rule links comma-separated
+      if (item.stateConfigMap.RULE_IDS) {
+        const raw = String(item.stateConfigMap.RULE_IDS || "");
+        const ids = raw.split(/[,\s]+/).filter((x) => /^\d+$/.test(x));
+        if (ids.length > 0) {
+          return ids.map((id) => `${location.origin}/rule-management/update-rule?ruleId=${id}`).join(", ");
+        }
+      }
+    } catch (e) {
+      console.warn("extractStateLink error", e);
+    }
+    // IMPORTANT: no fallback to referenceSim or other URL fields — return blank if none found
+    return "";
+  }
+
+  /* ------------------ DROP REASON extraction ------------------ */
+
+  function extractDropReason(item) {
+    if (!item) return "";
+    const candidates = [
+      "dropReason",
+      "dropReasonText",
+      "dropReasonMessage",
+      "dropReasonDetail",
+      "drop_reason",
+      "drop_reason_text",
+      "reason",
+      "dropExplanation",
+    ];
+    for (const c of candidates) {
+      if (Object.prototype.hasOwnProperty.call(item, c) && item[c]) {
+        return safeText(item[c]);
+      }
+    }
+    // nested drop structure
+    if (item.drop && typeof item.drop === "object") {
+      if (item.drop.reason) return safeText(item.drop.reason);
+      if (item.drop.message) return safeText(item.drop.message);
+    }
+    if (item.stateConfigMap && item.stateConfigMap.DROP_REASON) return safeText(item.stateConfigMap.DROP_REASON);
+    return "";
+  }
+
+  /* ------------------ Map item -> CSV row ------------------ */
+
+  function mapItemToCsvRow(item) {
+    const keywordName =
+      (item.keywordDetails && item.keywordDetails.keywordName) || item.keywordName || item.keyword || "";
+    const attributeFlag =
+      (item.keywordDetails && item.keywordDetails.attributeFlagged) || item.attributeFlagged || "";
+    const ingestionDate = item.creationTime ? formatEpochMsToUTC(item.creationTime) : (item.keywordIngestionDate || "");
+    const stateLink = extractStateLink(item);
+    const dropReason = extractDropReason(item);
+
+    return [
+      item.process || item.adProgram || "",
+      item.marketplace || "",
+      keywordName,
+      item.label || item.policy || "",
+      item.keywordSource || "",
+      attributeFlag,
+      item.ingestedUserName || item.keywordIngestedBy || "",
+      item.referenceSim || item.reference || "",
+      ingestionDate,
+      item.state || "",
+      item.assignedTo || item.assignedUser || "",
+      stateLink,
+      dropReason,
+    ];
+  }
+
+  /* ------------------ CSV generation + download ------------------ */
+
+  function triggerCsvDownload(rows) {
+    const header = [
+      "AD PROGRAM",
+      "MARKETPLACE",
+      "KEYWORD",
+      "POLICY",
+      "KEYWORD SOURCE",
+      "ATTRIBUTE FLAGGED",
+      "KEYWORD INGESTED BY",
+      "REFERENCE SIM",
+      "KEYWORD INGESTION DATE/TIME (UTC)",
+      "STATE",
+      "ASSIGNED USER",
+      "STATE LINK",
+      "DROP REASON",
+    ];
+    const lines = [header.join(",")];
+
+    for (const r of rows) {
+      const escaped = r.map((v) => {
+        if (v === null || v === undefined) return "";
+        const s = String(v);
+        if (/["\n\r,]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+        return s;
+      });
+      lines.push(escaped.join(","));
+    }
+
+    const csv = lines.join("\r\n");
+    const filename = `cre-unprocessed-${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.csv`;
+
+    try {
+      GM_download({ url: "data:text/csv;charset=utf-8," + encodeURIComponent(csv), name: filename, saveAs: false });
+      console.info("[CRE Export v2.9] GM_download initiated (saveAs:false)", filename);
+      return;
+    } catch (e) {
+      console.warn("[CRE Export v2.9] GM_download error, falling back to anchor blob", e);
+    }
+
+    try {
+      const blob = new Blob([csv], { type: "text/csv" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        URL.revokeObjectURL(a.href);
+        a.remove();
+      }, 1500);
+      console.info("[CRE Export v2.9] fallback download triggered", filename);
+    } catch (e) {
+      console.error("[CRE Export v2.9] final fallback failed, opening CSV in new tab", e);
+      const dataUrl = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
+      window.open(dataUrl, "_blank");
+    }
+  }
+
+  /* ------------------ Progress modal ------------------ */
+
+  function createProgressModal() {
+    const existing = document.getElementById("tm_cre_modal_v29");
+    if (existing) return existing._controller;
+    const overlay = document.createElement("div");
+    overlay.id = "tm_cre_modal_v29";
+    overlay.style.position = "fixed";
+    overlay.style.left = "0";
+    overlay.style.top = "0";
+    overlay.style.width = "100%";
+    overlay.style.height = "100%";
+    overlay.style.zIndex = 99999;
+    overlay.style.background = "rgba(0,0,0,0.45)";
+    overlay.style.display = "flex";
+    overlay.style.alignItems = "center";
+    overlay.style.justifyContent = "center";
+
+    const panel = document.createElement("div");
+    panel.style.width = "520px";
+    panel.style.maxWidth = "92%";
+    panel.style.background = "#fff";
+    panel.style.borderRadius = "8px";
+    panel.style.padding = "18px";
+    panel.style.boxShadow = "0 8px 30px rgba(0,0,0,0.4)";
+    panel.style.fontFamily = "Arial, sans-serif";
+    panel.style.color = "#222";
+
+    const title = document.createElement("div");
+    title.innerText = "Exporting CSV — Progress";
+    title.style.fontSize = "18px";
+    title.style.fontWeight = "700";
+    title.style.marginBottom = "8px";
+
+    const desc = document.createElement("div");
+    desc.innerText = "Fetching data from server. This may take a while for many pages. You can cancel at any time.";
+    desc.style.fontSize = "13px";
+    desc.style.marginBottom = "12px";
+    desc.style.color = "#444";
+
+    const barWrap = document.createElement("div");
+    barWrap.style.width = "100%";
+    barWrap.style.background = "#eee";
+    barWrap.style.borderRadius = "6px";
+    barWrap.style.overflow = "hidden";
+    barWrap.style.height = "14px";
+    barWrap.style.marginBottom = "12px";
+    const bar = document.createElement("div");
+    bar.style.width = "0%";
+    bar.style.height = "100%";
+    bar.style.background = "#4caf50";
+    bar.style.transition = "width 300ms ease";
+    barWrap.appendChild(bar);
+
+    const stats = document.createElement("div");
+    stats.style.fontSize = "13px";
+    stats.style.display = "flex";
+    stats.style.justifyContent = "space-between";
+    stats.style.marginBottom = "12px";
+    stats.innerHTML = `<span>Rows fetched: 0</span><span>Pages: 0</span>`;
+
+    const details = document.createElement("div");
+    details.style.fontSize = "12px";
+    details.style.color = "#333";
+    details.style.marginBottom = "12px";
+    details.innerText = "Last page count: 0";
+
+    const autoCloseNote = document.createElement("div");
+    autoCloseNote.style.fontSize = "12px";
+    autoCloseNote.style.color = "#555";
+    autoCloseNote.style.marginBottom = "8px";
+    autoCloseNote.innerText = AUTO_CLOSE_SECONDS > 0 ? `Modal will auto-close ${AUTO_CLOSE_SECONDS}s after completion.` : "Modal will not auto-close (0).";
+
+    const btnRow = document.createElement("div");
+    btnRow.style.display = "flex";
+    btnRow.style.justifyContent = "flex-end";
+    btnRow.style.gap = "8px";
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.innerText = "Cancel";
+    cancelBtn.style.background = "#f44336";
+    cancelBtn.style.color = "#fff";
+    cancelBtn.style.border = "none";
+    cancelBtn.style.padding = "8px 12px";
+    cancelBtn.style.borderRadius = "4px";
+    cancelBtn.style.cursor = "pointer";
+
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.innerText = "Close";
+    closeBtn.style.background = "#e0e0e0";
+    closeBtn.style.color = "#111";
+    closeBtn.style.border = "none";
+    closeBtn.style.padding = "8px 12px";
+    closeBtn.style.borderRadius = "4px";
+    closeBtn.style.cursor = "pointer";
+    closeBtn.style.display = "none";
+
+    btnRow.appendChild(closeBtn);
+    btnRow.appendChild(cancelBtn);
+
+    panel.appendChild(title);
+    panel.appendChild(desc);
+    panel.appendChild(barWrap);
+    panel.appendChild(stats);
+    panel.appendChild(details);
+    panel.appendChild(autoCloseNote);
+    panel.appendChild(btnRow);
+
+    overlay.appendChild(panel);
+    document.body.appendChild(overlay);
+
+    let cancelled = false;
+    let autoCloseTimer = null;
+    let remaining = AUTO_CLOSE_SECONDS;
+
+    function update({ rows = 0, pages = 0, lastCount = 0, percent = null, message = "" } = {}) {
+      stats.innerHTML = `<span>Rows fetched: ${rows}</span><span>Pages: ${pages}</span>`;
+      details.innerText = `Last page count: ${lastCount}${message ? " — " + message : ""}`;
+      if (percent !== null) bar.style.width = `${Math.min(100, Math.max(0, percent))}%`;
+      else bar.style.width = `${Math.min(100, Math.log10(1 + rows) * 12)}%`;
+    }
+
+    function startAutoCloseCountdown() {
+      if (autoCloseTimer) { clearInterval(autoCloseTimer); autoCloseTimer = null; }
+      remaining = AUTO_CLOSE_SECONDS;
+      if (!remaining || remaining <= 0) return;
+      autoCloseTimer = setInterval(() => {
+        if (remaining <= 0) {
+          clearInterval(autoCloseTimer);
+          autoCloseTimer = null;
+          destroy();
+          return;
+        }
+        details.innerText = details.innerText.replace(/\s*—\s*Closing in.*$/,'') + ` — Closing in ${remaining}s...`;
+        remaining--;
+      }, 1000);
+    }
+
+    function setDone() {
+      cancelBtn.style.display = "none";
+      closeBtn.style.display = "inline-block";
+      bar.style.width = "100%";
+      details.innerText = details.innerText + " — Complete";
+      startAutoCloseCountdown();
+    }
+
+    function setError(msg) {
+      cancelBtn.style.display = "none";
+      closeBtn.style.display = "inline-block";
+      bar.style.background = "#f44336";
+      details.innerText = details.innerText + " — Error: " + msg;
+    }
+
+    function destroy() {
+      if (autoCloseTimer) { clearInterval(autoCloseTimer); autoCloseTimer = null; }
+      overlay.remove();
+    }
+
+    cancelBtn.addEventListener("click", () => { cancelled = true; details.innerText = details.innerText + " — Cancelling..."; });
+    closeBtn.addEventListener("click", () => { if (autoCloseTimer) clearInterval(autoCloseTimer); destroy(); });
+
+    overlay._controller = { update, setDone, setError, destroy, isCancelled: () => cancelled };
+    return overlay._controller;
+  }
+
+  /* ------------------ Fetch pages with modal + throttle ------------------ */
+
+  async function fetchAllPagesWithModal(template, controller) {
+    const all = [];
+    let start = template.pagination && template.pagination.startIndex ? template.pagination.startIndex : 0;
+    const size = (template.pagination && template.pagination.size) || PAGE_SIZE;
+    let pagesFetched = 0;
+
+    while (true) {
+      if (controller.isCancelled()) break;
+      template.pagination.startIndex = start;
+      console.info(`[CRE Export v2.9] fetching startIndex=${start}`);
+
+      const resp = await new Promise((res, rej) => {
+        GM_xmlhttpRequest({
+          method: "POST",
+          url: location.origin + API_ENDPOINT,
+          headers: { "Content-Type": "application/json", Accept: "application/json, text/plain, */*" },
+          data: JSON.stringify(template),
+          onload: (r) => res(r),
+          onerror: (e) => rej(e),
+          ontimeout: (e) => rej(e),
+        });
+      });
+
+      let json;
+      try {
+        json = JSON.parse(resp.responseText);
+      } catch (e) {
+        // attempt to extract JSON substring
+        try {
+          const txt = resp.responseText || "";
+          const first = txt.indexOf("{");
+          const last = txt.lastIndexOf("}");
+          if (first !== -1 && last !== -1 && last > first) json = JSON.parse(txt.substring(first, last + 1));
+          else json = {};
+        } catch (e2) {
+          throw new Error("Failed to parse server response as JSON");
+        }
+      }
+
+      const items = normalizeItemsArray(json);
+      const count = items.length || 0;
+      all.push(...items);
+      pagesFetched++;
+      controller.update({ rows: all.length, pages: pagesFetched, lastCount: count });
+
+      if (controller.isCancelled()) break;
+      if (count === 0) break;
+      if (count < size) break;
+
+      await sleep(DEFAULT_DELAY_MS);
+
+      start += size;
+      if (all.length > 500000) throw new Error("Too many rows - aborting");
+    }
+    return all;
+  }
+
+  /* ------------------ Attach Export button ------------------ */
+
+  function attachExportButton() {
+    if (document.getElementById("tm_cre_export_v29")) return;
+    const listBtn = Array.from(document.querySelectorAll("button, a")).find((el) => (el.innerText || "").trim().toUpperCase() === "LIST KEYWORDS");
+    const fallbackBtn = document.querySelector("button.btn-primary, button.btn.btn-default.btn-primary");
+    const anchor = listBtn || fallbackBtn;
+    if (!anchor) return;
+
+    const btn = document.createElement("button");
+    btn.id = "tm_cre_export_v29";
+    btn.type = "button";
+    btn.className = "btn btn-default";
+    btn.style.marginLeft = "8px";
+    btn.style.background = "#ffea3b";
+    btn.style.color = "#111";
+    btn.style.border = "1px solid #c5b300";
+    btn.style.fontWeight = "600";
+    btn.style.padding = "6px 10px";
+    btn.innerText = EXPORT_BTN_TEXT;
+
+    anchor.parentNode.insertBefore(btn, anchor.nextSibling);
+
+    btn.addEventListener("click", async () => {
+      try {
+        btn.disabled = true;
+        btn.innerText = "Exporting...";
+        console.info("[CRE Export v2.9] Start export");
+
+        const { template, detected } = buildTemplateFromReactSelects();
+        console.info("[CRE Export v2.9] Detected:", detected);
+
+        if (!template.keywordSearchCriteria.processes.length || !template.keywordSearchCriteria.marketplaces.length) {
+          console.warn("[CRE Export v2.9] Could not detect Ad Program / Marketplace. Falling back to SPONSORED_PRODUCTS + BE");
+          template.keywordSearchCriteria.processes = ["SPONSORED_PRODUCTS"];
+          template.keywordSearchCriteria.marketplaces = ["BE"];
+        }
+
+        const controller = createProgressModal();
+        controller.update({ rows: 0, pages: 0, lastCount: 0, percent: 0, message: "Starting..." });
+
+        let rows = [];
+        try {
+          rows = await fetchAllPagesWithModal(template, controller);
+        } catch (err) {
+          controller.setError(err.message || String(err));
+          console.error("[CRE Export v2.9] fetch error:", err);
+          throw err;
+        }
+
+        if (!rows || rows.length === 0) {
+          controller.update({ rows: 0, pages: 0, lastCount: 0, message: "No rows found" });
+          controller.setDone();
+          btn.disabled = false;
+          btn.innerText = EXPORT_BTN_TEXT;
+          return;
+        }
+
+        controller.update({
+          rows: rows.length,
+          pages: Math.ceil(rows.length / PAGE_SIZE),
+          lastCount: rows.length % PAGE_SIZE || PAGE_SIZE,
+          percent: 100,
+          message: "Preparing CSV...",
+        });
+
+        const csvRows = rows.map(mapItemToCsvRow);
+        try {
+          triggerCsvDownload(csvRows);
+          controller.setDone();
+        } catch (e) {
+          controller.setError(e.message || "Download failed");
+          console.error("[CRE Export v2.9] download error", e);
+        }
+      } catch (err) {
+        alert("Export failed: " + (err && err.message ? err.message : "unknown"));
+      } finally {
+        btn.disabled = false;
+        btn.innerText = EXPORT_BTN_TEXT;
+      }
+    });
+  }
+
+  const observer = new MutationObserver(() => attachExportButton());
+  observer.observe(document.documentElement || document.body, { childList: true, subtree: true });
+  setTimeout(attachExportButton, 800);
+
+  console.info("[CRE Export v2.9] ready - STATE LINK: experiment preferred, RULE_IDS -> all links, no fallback.");
+})();
